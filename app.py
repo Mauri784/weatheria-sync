@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_file, request
 from flask_cors import CORS
 import requests
 import json
@@ -8,7 +8,16 @@ from datetime import datetime
 import threading
 
 app = Flask(__name__)
-CORS(app)
+# Configurar CORS para permitir peticiones desde Vercel
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://weatheria1-topaz.vercel.app"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Variables de entorno
 API_KEY = os.environ.get("WEATHER_COM_API_KEY", "c64e8a47b0f348298e8a47b0f3f829cd")
@@ -30,6 +39,9 @@ ultimo_estado = {
     "total_registros": 0,
     "ultima_actualizacion": None
 }
+
+# Variable global para almacenar reportes de inundaciones
+reportes_inundacion = []
 
 
 # --- FUNCIONES FIREBASE CON REQUESTS ---
@@ -282,6 +294,57 @@ def descargar_json():
                 'status': 'error',
                 'message': 'No hay archivo JSON disponible'
             }), 404
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/flood_history', methods=['GET'])
+def obtener_historial_inundaciones():
+    """Obtener el historial de reportes de inundaciones"""
+    try:
+        return jsonify({
+            'status': 'success',
+            'total': len(reportes_inundacion),
+            'data': reportes_inundacion
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/report_flood', methods=['POST'])
+def reportar_inundacion():
+    """Endpoint para reportar una inundación"""
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        # Agregar timestamp al reporte
+        reporte = {
+            **data,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'id': len(reportes_inundacion) + 1
+        }
+        
+        reportes_inundacion.append(reporte)
+        
+        # Opcional: guardar en Firebase
+        try:
+            firebase_post("/reportes_inundacion", reporte)
+        except Exception as fb_error:
+            print(f"Error guardando en Firebase: {fb_error}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Reporte de inundación registrado correctamente',
+            'data': reporte
+        })
+        
     except Exception as e:
         return jsonify({
             'status': 'error',

@@ -1,76 +1,24 @@
-from flask import Flask, jsonify, send_file
-from flask_cors import CORS
 import requests
 import json
+import time
 import csv
 import os
 from datetime import datetime
-import threading
+from firebase import firebase
 
-app = Flask(__name__)
-CORS(app)
+API_KEY = "c64e8a47b0f348298e8a47b0f3f829cd"
+STATION_ID = "ISANTI245"
+FIREBASE_URL = "https://weatheriadx-default-rtdb.firebaseio.com/"
 
-# Variables de entorno
-API_KEY = os.environ.get("WEATHER_COM_API_KEY", "c64e8a47b0f348298e8a47b0f3f829cd")
-STATION_ID = os.environ.get("STATION_ID", "ISANTI245")
-FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://weatheriadx-default-rtdb.firebaseio.com")
+db = firebase.FirebaseApplication(FIREBASE_URL, None)
 
-# Asegurar que Firebase URL no tenga / al final
-FIREBASE_URL = FIREBASE_URL.rstrip('/')
-
-# Directorios
+# 🔧 BASE_DIR siempre apunta al directorio real donde está este archivo
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 LAST_TS_FILE = os.path.join(BASE_DIR, "last_timestamp.txt")
 JSON_FILE = os.path.join(BASE_DIR, "registros.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "history")
 
-# Variable global para almacenar el último estado
-ultimo_estado = {
-    "ultimo_registro": None,
-    "total_registros": 0,
-    "ultima_actualizacion": None
-}
-
-
-# --- FUNCIONES FIREBASE CON REQUESTS ---
-
-def firebase_post(path, data):
-    """POST a Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.post(url, json=data)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_post: {e}")
-        return None
-
-
-def firebase_put(path, data):
-    """PUT a Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.put(url, json=data)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_put: {e}")
-        return None
-
-
-def firebase_get(path):
-    """GET de Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_get: {e}")
-        return None
-
-
-# --- FUNCIONES PRINCIPALES ---
 
 def get_data():
     """Obtiene datos meteorológicos actuales desde Weather.com"""
@@ -110,7 +58,7 @@ def process_and_upload(datos):
             "timestamp": datos["local_timestamp"]
         }
 
-        firebase_post("/registros", registro)
+        db.post("/registros", registro)
         print(f"[{registro['timestamp']}] Datos subidos a Firebase:", registro)
         return registro
     except Exception as e:
@@ -118,190 +66,64 @@ def process_and_upload(datos):
         return None
 
 
-def save_to_csv(registros):
-    """Guarda los datos en CSV separados por día"""
-    if not registros:
-        return
+def save_to_csv_firebase(registro):
+    fecha = datetime.now().strftime("%Y-%m-%d")
 
-    registros_por_dia = {}
-    for reg in registros:
-        try:
-            fecha = datetime.fromisoformat(reg["timestamp"]).strftime("%Y-%m-%d")
-        except Exception:
-            fecha = datetime.now().strftime("%Y-%m-%d")
+    try:
+        existing = db.get("/csv_history", fecha)
 
-        registros_por_dia.setdefault(fecha, []).append(reg)
+        if isinstance(existing, str):
+            existing = []
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+        if not existing:
+            existing = []
 
-    for fecha, registros_dia in registros_por_dia.items():
-        filename = os.path.join(OUTPUT_DIR, f"{fecha}.csv")
-        file_exists = os.path.exists(filename)
+        existing.append(registro)
 
-        fieldnames = sorted(list({k for r in registros_dia for k in r.keys()}))
+        db.put("/csv_history", fecha, existing)
 
-        with open(filename, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerows(registros_dia)
+        print(f"Registro agregado al historial del día {fecha}")
 
-        print(f"[{datetime.now()}] Guardados {len(registros_dia)} registros en {filename}")
+    except Exception as e:
+        print("Error guardando historial:", e)
 
 
 def save_to_json(registros):
-    """Guarda todos los datos en un JSON y lo sube a Firebase"""
     try:
-        with open(JSON_FILE, "w", encoding="utf-8") as jsonfile:
-            json.dump(registros, jsonfile, indent=4, ensure_ascii=False)
-        print(f"[{datetime.now()}] Guardados {len(registros)} registros en {JSON_FILE}")
-
-        firebase_put("/json_data", registros)
+        db.put("/", "json_data", registros)
         print(f"[{datetime.now()}] Datos JSON subidos a Firebase (/json_data)")
     except Exception as e:
-        print(f"Error al guardar/subir JSON: {e}")
+        print(f"Error JSON Firebase: {e}")
+
 
 
 def load_existing_data():
-    """Carga el JSON existente para no perder registros previos"""
-    if os.path.exists(JSON_FILE):
-        try:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
-    return []
+    try:
+        data = db.get("/json_data", None)
+        return data if data else []
+    except:
+        return []
 
 
-def actualizar_datos_interno():
-    """Función interna para actualizar los datos meteorológicos"""
-    global ultimo_estado
-    
+
+def main_loop():
+    print("🌦️ Sistema Weatheria iniciado (sincronización cada 15 minutos).")
     all_records = load_existing_data()
-    datos = get_data()
-    
-    if datos:
-        registro = process_and_upload(datos)
-        if registro:
-            all_records.append(registro)
-            save_to_csv([registro])
-            save_to_json(all_records)
-            
-            ultimo_estado = {
-                "ultimo_registro": registro,
-                "total_registros": len(all_records),
-                "ultima_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            return True, registro
-    
-    return False, None
 
-
-# --- ENDPOINTS DE LA API ---
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'ok',
-        'message': 'API de sincronización meteorológica funcionando',
-        'ultima_actualizacion': ultimo_estado.get('ultima_actualizacion'),
-        'total_registros': ultimo_estado.get('total_registros', 0)
-    })
-
-
-@app.route('/actualizar', methods=['GET', 'POST'])
-def actualizar_datos():
-    """Endpoint para forzar una actualización de datos"""
-    try:
-        exito, registro = actualizar_datos_interno()
-        
-        if exito:
-            return jsonify({
-                'status': 'success',
-                'message': 'Datos actualizados correctamente',
-                'data': registro
-            })
+    while True:
+        datos = get_data()
+        if datos:
+            registro = process_and_upload(datos)
+            if registro:
+                all_records.append(registro)
+                save_to_csv_firebase(registro)
+                save_to_json(all_records)
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No se pudieron obtener datos válidos'
-            }), 500
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+            print(f"[{datetime.now()}] No se obtuvieron datos válidos, reintentando...")
+
+        print("⏳ Esperando 15 minutos para la siguiente actualización...\n")
+        time.sleep(900)  # 900 segundos = 15 minutos
 
 
-@app.route('/registros', methods=['GET'])
-def obtener_registros():
-    """Obtener todos los registros guardados"""
-    try:
-        registros = load_existing_data()
-        return jsonify({
-            'status': 'success',
-            'total': len(registros),
-            'data': registros
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/ultimo', methods=['GET'])
-def obtener_ultimo():
-    """Obtener el último registro"""
-    try:
-        if ultimo_estado.get('ultimo_registro'):
-            return jsonify({
-                'status': 'success',
-                'data': ultimo_estado['ultimo_registro']
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No hay registros disponibles'
-            }), 404
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/descargar-json', methods=['GET'])
-def descargar_json():
-    """Descargar el archivo JSON completo"""
-    try:
-        if os.path.exists(JSON_FILE):
-            return send_file(JSON_FILE, as_attachment=True, download_name='registros.json')
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No hay archivo JSON disponible'
-            }), 404
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-def inicializar():
-    """Se ejecuta una vez al iniciar el servidor"""
-    print("🌦️ Iniciando servidor de sincronización meteorológica...")
-    try:
-        actualizar_datos_interno()
-        print("✅ Primera actualización completada")
-    except Exception as e:
-        print(f"❌ Error en inicialización: {e}")
-
-
-if __name__ == '__main__':
-    # Ejecutar inicialización en un hilo separado
-    threading.Thread(target=inicializar, daemon=True).start()
-    
-    # Iniciar el servidor Flask
-    app.run(host='0.0.0.0', port=5003, debug=False)
+if __name__ == "__main__":
+    main_loop()

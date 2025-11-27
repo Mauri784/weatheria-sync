@@ -1,5 +1,4 @@
 Flask
 flask-cors
 requests
-python-firebase
 gunicorn

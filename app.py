@@ -5,7 +5,6 @@ import json
 import csv
 import os
 from datetime import datetime
-from firebase import firebase
 import threading
 
 app = Flask(__name__)
@@ -14,9 +13,10 @@ CORS(app)
 # Variables de entorno
 API_KEY = os.environ.get("WEATHER_COM_API_KEY", "c64e8a47b0f348298e8a47b0f3f829cd")
 STATION_ID = os.environ.get("STATION_ID", "ISANTI245")
-FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://weatheriadx-default-rtdb.firebaseio.com/")
+FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://weatheriadx-default-rtdb.firebaseio.com")
 
-db = firebase.FirebaseApplication(FIREBASE_URL, None)
+# Asegurar que Firebase URL no tenga / al final
+FIREBASE_URL = FIREBASE_URL.rstrip('/')
 
 # Directorios
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +31,46 @@ ultimo_estado = {
     "ultima_actualizacion": None
 }
 
+
+# --- FUNCIONES FIREBASE CON REQUESTS ---
+
+def firebase_post(path, data):
+    """POST a Firebase usando requests"""
+    try:
+        url = f"{FIREBASE_URL}{path}.json"
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error en firebase_post: {e}")
+        return None
+
+
+def firebase_put(path, data):
+    """PUT a Firebase usando requests"""
+    try:
+        url = f"{FIREBASE_URL}{path}.json"
+        response = requests.put(url, json=data)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error en firebase_put: {e}")
+        return None
+
+
+def firebase_get(path):
+    """GET de Firebase usando requests"""
+    try:
+        url = f"{FIREBASE_URL}{path}.json"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error en firebase_get: {e}")
+        return None
+
+
+# --- FUNCIONES PRINCIPALES ---
 
 def get_data():
     """Obtiene datos meteorológicos actuales desde Weather.com"""
@@ -70,7 +110,7 @@ def process_and_upload(datos):
             "timestamp": datos["local_timestamp"]
         }
 
-        db.post("/registros", registro)
+        firebase_post("/registros", registro)
         print(f"[{registro['timestamp']}] Datos subidos a Firebase:", registro)
         return registro
     except Exception as e:
@@ -116,7 +156,7 @@ def save_to_json(registros):
             json.dump(registros, jsonfile, indent=4, ensure_ascii=False)
         print(f"[{datetime.now()}] Guardados {len(registros)} registros en {JSON_FILE}")
 
-        db.put("/", "json_data", registros)
+        firebase_put("/json_data", registros)
         print(f"[{datetime.now()}] Datos JSON subidos a Firebase (/json_data)")
     except Exception as e:
         print(f"Error al guardar/subir JSON: {e}")

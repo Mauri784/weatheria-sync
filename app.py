@@ -1,370 +1,166 @@
-from flask import Flask, jsonify, send_file, request
-from flask_cors import CORS
-import requests
-import json
-import csv
+import sys
 import os
-from datetime import datetime
-import threading
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from flask import Flask, jsonify, request
+from werkzeug.security import generate_password_hash, check_password_hash
+import re
+import sqlite3
+from flask_cors import CORS
+from dotenv import load_dotenv
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import datetime
+import googlemaps
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+
+load_dotenv()
 
 app = Flask(__name__)
-# Configurar CORS para permitir peticiones desde Vercel
-CORS(app, resources={
-    r"/*": {
-        "origins": [
-            "https://weatheria1-topaz.vercel.app"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+CORS(app)
 
-# Variables de entorno
-API_KEY = os.environ.get("WEATHER_COM_API_KEY", "c64e8a47b0f348298e8a47b0f3f829cd")
-STATION_ID = os.environ.get("STATION_ID", "ISANTI245")
-FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://weatheriadx-default-rtdb.firebaseio.com")
+# Configuración JWT
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'tu_clave_secreta_super_fuerte')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = datetime.timedelta(minutes=30)
+jwt = JWTManager(app)
 
-# Asegurar que Firebase URL no tenga / al final
-FIREBASE_URL = FIREBASE_URL.rstrip('/')
+# Google Maps
+API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
+if not API_KEY:
+    raise ValueError("Clave de API de Google Maps no encontrada")
+gmaps = googlemaps.Client(key=API_KEY)
 
-# Directorios
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LAST_TS_FILE = os.path.join(BASE_DIR, "last_timestamp.txt")
-JSON_FILE = os.path.join(BASE_DIR, "registros.json")
-OUTPUT_DIR = os.path.join(BASE_DIR, "history")
+# Base de datos
+DB_PATH = os.path.join(os.path.dirname(__file__), 'database.db')
 
-# Variable global para almacenar el último estado
-ultimo_estado = {
-    "ultimo_registro": None,
-    "total_registros": 0,
-    "ultima_actualizacion": None
-}
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            status INTEGER NOT NULL
+        )
+    ''')
+    initial_users = [
+        ("username1", generate_password_hash("Hola.123"), 1),
+        ("username2", generate_password_hash("Hola.123"), 1),
+        ("username3", generate_password_hash("Hola.123"), 1),
+        ("username4", generate_password_hash("Hola.123"), 1)
+    ]
+    for username, hashed_password, status in initial_users:
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (username, password, status) VALUES (?, ?, ?)",
+            (username, hashed_password, status)
+        )
+    conn.commit()
+    conn.close()
 
-# Variable global para almacenar reportes de inundaciones
-reportes_inundacion = []
+def validate_username(username: str) -> bool:
+    return bool(username and 3 <= len(username) <= 50 and re.match(r'^[a-zA-Z0-9_]+$', username))
 
+# === RUTAS ===
 
-# --- FUNCIONES FIREBASE CON REQUESTS ---
+@app.route('/')
+def health_check():
+    return jsonify({'message': 'Backend funcionando correctamente'})
 
-def firebase_post(path, data):
-    """POST a Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.post(url, json=data)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_post: {e}")
-        return None
+# RUTA LOGIN - AHORA DEVUELVE "token" (lo que espera tu frontend)
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
 
+    if not data or 'username' not in data or 'password' not in data:
+        return jsonify({"message": "Faltan username o password"}), 400
 
-def firebase_put(path, data):
-    """PUT a Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.put(url, json=data)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_put: {e}")
-        return None
+    username = data['username'].strip()
+    password = data['password']
 
+    if not validate_username(username):
+        return jsonify({"message": "Username inválido"}), 400
 
-def firebase_get(path):
-    """GET de Firebase usando requests"""
-    try:
-        url = f"{FIREBASE_URL}{path}.json"
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error en firebase_get: {e}")
-        return None
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT password, status FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
 
+    if not user:
+        return jsonify({"message": "Usuario no encontrado"}), 404
 
-# --- FUNCIONES PRINCIPALES ---
+    hashed_password, status = user
 
-def get_data():
-    """Obtiene datos meteorológicos actuales desde Weather.com"""
-    url = (
-        f"https://api.weather.com/v2/pws/observations/current?"
-        f"stationId={STATION_ID}&format=json&units=m&apiKey={API_KEY}"
+    if status != 1:
+        return jsonify({"message": "Usuario inactivo"}), 403
+
+    if check_password_hash(hashed_password, password):
+        access_token = create_access_token(identity=username)
+        return jsonify({
+            "token": access_token,        # ← ¡¡ESTO ES LO QUE ESPERA TU FRONTEND!!
+            "username": username,
+            "message": "Login exitoso"
+        }), 200
+    else:
+        return jsonify({"message": "Contraseña incorrecta"}), 401
+
+# Ruta protegida para reportar inundación
+@app.route('/report_flood', methods=['POST'])
+@jwt_required()
+def report_flood():
+    current_user = get_jwt_identity()
+    data = request.get_json()
+    required_fields = ['ubicacion', 'fecha', 'temperatura', 'descripcion_clima', 'mensaje']
+    
+    if not all(field in data for field in required_fields):
+        return jsonify({"message": "Todos los campos son requeridos"}), 400
+
+    ubicacion = data['ubicacion']
+    fecha = data['fecha']
+    temperatura = data['temperatura']
+    descripcion_clima = data['descripcion_clima']
+    mensaje = data['mensaje']
+
+    SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
+    SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+    COMPANY_EMAIL = os.environ.get("COMPANY_EMAIL")
+
+    if not all([SENDGRID_API_KEY, SENDER_EMAIL, COMPANY_EMAIL]):
+        return jsonify({"message": "Faltan variables de entorno de SendGrid"}), 500
+
+    body = f"""
+Se ha recibido un reporte de inundación desde la app Weatheria.
+
+Usuario: {current_user}
+Ubicación: {ubicacion}
+Fecha: {fecha}
+Temperatura: {temperatura}
+Descripción del clima: {descripcion_clima}
+Mensaje: {mensaje}
+
+Verificar inmediatamente la zona reportada.
+    """
+
+    email = Mail(
+        from_email=SENDER_EMAIL,
+        to_emails=COMPANY_EMAIL,
+        subject="Reporte de Inundación - Weatheria App",
+        plain_text_content=body
     )
 
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        datos = response.json()
-        datos["local_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return datos
-    except requests.exceptions.RequestException as e:
-        print(f"[{datetime.now()}] Error al obtener datos: {e}")
-        return None
-
-
-def process_and_upload(datos):
-    """Procesa los datos y los sube a Firebase"""
-    try:
-        obs = datos["observations"][0]
-        metric = obs["metric"]
-
-        registro = {
-            "temp": metric.get("temp"),
-            "heatIndex": metric.get("heatIndex"),
-            "dewpt": metric.get("dewpt"),
-            "windChill": metric.get("windChill"),
-            "windSpeed": metric.get("windSpeed"),
-            "windGust": metric.get("windGust"),
-            "humidity": obs.get("humidity"),
-            "pressure": metric.get("pressure"),
-            "precipRate": metric.get("precipRate"),
-            "precipTotal": metric.get("precipTotal"),
-            "timestamp": datos["local_timestamp"]
-        }
-
-        firebase_post("/registros", registro)
-        print(f"[{registro['timestamp']}] Datos subidos a Firebase:", registro)
-        return registro
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(email)
+        print("EMAIL ENVIADO - STATUS:", response.status_code)
+        return jsonify({"message": "Reporte enviado exitosamente"}), 200
     except Exception as e:
-        print(f"[Error al subir datos a Firebase: {e}]")
-        return None
+        print("ERROR SENDGRID:", str(e))
+        return jsonify({"message": f"Error al enviar correo: {str(e)}"}), 500
 
+# Inicializar base de datos
+init_db()
 
-def save_to_csv(registros):
-    """Guarda los datos en CSV separados por día"""
-    if not registros:
-        return
-
-    registros_por_dia = {}
-    for reg in registros:
-        try:
-            fecha = datetime.fromisoformat(reg["timestamp"]).strftime("%Y-%m-%d")
-        except Exception:
-            fecha = datetime.now().strftime("%Y-%m-%d")
-
-        registros_por_dia.setdefault(fecha, []).append(reg)
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    for fecha, registros_dia in registros_por_dia.items():
-        filename = os.path.join(OUTPUT_DIR, f"{fecha}.csv")
-        file_exists = os.path.exists(filename)
-
-        fieldnames = sorted(list({k for r in registros_dia for k in r.keys()}))
-
-        with open(filename, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerows(registros_dia)
-
-        print(f"[{datetime.now()}] Guardados {len(registros_dia)} registros en {filename}")
-
-
-def save_to_json(registros):
-    """Guarda todos los datos en un JSON y lo sube a Firebase"""
-    try:
-        with open(JSON_FILE, "w", encoding="utf-8") as jsonfile:
-            json.dump(registros, jsonfile, indent=4, ensure_ascii=False)
-        print(f"[{datetime.now()}] Guardados {len(registros)} registros en {JSON_FILE}")
-
-        firebase_put("/json_data", registros)
-        print(f"[{datetime.now()}] Datos JSON subidos a Firebase (/json_data)")
-    except Exception as e:
-        print(f"Error al guardar/subir JSON: {e}")
-
-
-def load_existing_data():
-    """Carga el JSON existente para no perder registros previos"""
-    if os.path.exists(JSON_FILE):
-        try:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-
-def actualizar_datos_interno():
-    """Función interna para actualizar los datos meteorológicos"""
-    global ultimo_estado
-    
-    all_records = load_existing_data()
-    datos = get_data()
-    
-    if datos:
-        registro = process_and_upload(datos)
-        if registro:
-            all_records.append(registro)
-            save_to_csv([registro])
-            save_to_json(all_records)
-            
-            ultimo_estado = {
-                "ultimo_registro": registro,
-                "total_registros": len(all_records),
-                "ultima_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            return True, registro
-    
-    return False, None
-
-
-# --- ENDPOINTS DE LA API ---
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'ok',
-        'message': 'API de sincronización meteorológica funcionando',
-        'ultima_actualizacion': ultimo_estado.get('ultima_actualizacion'),
-        'total_registros': ultimo_estado.get('total_registros', 0)
-    })
-
-
-@app.route('/actualizar', methods=['GET', 'POST'])
-def actualizar_datos():
-    """Endpoint para forzar una actualización de datos"""
-    try:
-        exito, registro = actualizar_datos_interno()
-        
-        if exito:
-            return jsonify({
-                'status': 'success',
-                'message': 'Datos actualizados correctamente',
-                'data': registro
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No se pudieron obtener datos válidos'
-            }), 500
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/registros', methods=['GET'])
-def obtener_registros():
-    """Obtener todos los registros guardados"""
-    try:
-        registros = load_existing_data()
-        return jsonify({
-            'status': 'success',
-            'total': len(registros),
-            'data': registros
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/ultimo', methods=['GET'])
-def obtener_ultimo():
-    """Obtener el último registro"""
-    try:
-        if ultimo_estado.get('ultimo_registro'):
-            return jsonify({
-                'status': 'success',
-                'data': ultimo_estado['ultimo_registro']
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No hay registros disponibles'
-            }), 404
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/descargar-json', methods=['GET'])
-def descargar_json():
-    """Descargar el archivo JSON completo"""
-    try:
-        if os.path.exists(JSON_FILE):
-            return send_file(JSON_FILE, as_attachment=True, download_name='registros.json')
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No hay archivo JSON disponible'
-            }), 404
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/flood_history', methods=['GET'])
-def obtener_historial_inundaciones():
-    """Obtener el historial de reportes de inundaciones"""
-    try:
-        return jsonify({
-            'status': 'success',
-            'total': len(reportes_inundacion),
-            'data': reportes_inundacion
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/report_flood', methods=['POST'])
-def reportar_inundacion():
-    """Endpoint para reportar una inundación"""
-    try:
-        from flask import request
-        data = request.get_json()
-        
-        # Agregar timestamp al reporte
-        reporte = {
-            **data,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'id': len(reportes_inundacion) + 1
-        }
-        
-        reportes_inundacion.append(reporte)
-        
-        # Opcional: guardar en Firebase
-        try:
-            firebase_post("/reportes_inundacion", reporte)
-        except Exception as fb_error:
-            print(f"Error guardando en Firebase: {fb_error}")
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Reporte de inundación registrado correctamente',
-            'data': reporte
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-def inicializar():
-    """Se ejecuta una vez al iniciar el servidor"""
-    print("🌦️ Iniciando servidor de sincronización meteorológica...")
-    try:
-        actualizar_datos_interno()
-        print("✅ Primera actualización completada")
-    except Exception as e:
-        print(f"❌ Error en inicialización: {e}")
-
-
+# === ARRANQUE DEL SERVIDOR (compatible con Render) ===
 if __name__ == '__main__':
-    # Ejecutar inicialización en un hilo separado
-    threading.Thread(target=inicializar, daemon=True).start()
-    
-    # Iniciar el servidor Flask
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5001))
+    app.run(host='0.0.0.0', port=port, debug=True)
